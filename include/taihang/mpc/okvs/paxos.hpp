@@ -338,7 +338,7 @@ public:
    void encode(value_type *values, value_type *output, prg::Seed *prng = nullptr);
 
    // Decode for a key.
-   value_type decode_1(const Block *key, const std::vector<value_type> output);
+   value_type decode_1(const Block *key, const std::vector<value_type> &output);
    value_type decode_1(const Block *key, const value_type *output);
    void decode_1(const Block *key, const value_type *output, value_type *value, Block *with_dense = nullptr);
 

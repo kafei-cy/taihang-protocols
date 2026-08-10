@@ -1407,7 +1407,7 @@ void OKVS<idx_type, dense_type, value_type>::encode(value_type *values,value_typ
 }
 
 template <typename idx_type, DenseType dense_type, typename value_type>
-value_type OKVS<idx_type, dense_type, value_type>::decode_1(const Block *key, const std::vector<value_type> output)
+value_type OKVS<idx_type, dense_type, value_type>::decode_1(const Block *key, const std::vector<value_type> &output)
 {
    return decode_1(key, output.data());
 }
@@ -1430,7 +1430,7 @@ void OKVS<idx_type, dense_type, value_type>::decode_1(const Block *key, const va
    }
 
    std::vector<idx_type> sparse;
-   sparse.reserve(sparse_weight);
+   sparse.resize(sparse_weight);
    // set_sparse
    set_sparse_1(dense_pointer, sparse.data());
 

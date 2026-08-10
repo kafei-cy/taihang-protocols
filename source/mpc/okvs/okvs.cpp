@@ -697,10 +697,6 @@ struct BlockLess {
 
 std::vector<Block> pad_keys(const PublicParameters& pp,
                             const std::vector<Block>& keys) {
-    if (keys.size() == pp.item_num) {
-        return keys;
-    }
-
     std::vector<Block> padded = keys;
     padded.reserve(pp.item_num);
 
@@ -716,10 +712,6 @@ std::vector<Block> pad_keys(const PublicParameters& pp,
 }
 
 std::vector<Block> pad_values(const std::vector<Block>& values, size_t target_size) {
-    if (values.size() == target_size) {
-        return values;
-    }
-
     std::vector<Block> padded = values;
     padded.resize(target_size, kZeroBlock);
     return padded;
@@ -772,6 +764,12 @@ std::vector<Block> encode_impl(const PublicParameters& pp,
                                prg::Seed* prng) {
     auto baxos = make_baxos<dense_type>(pp);
     std::vector<Block> encoded(pp.storage_size);
+
+    if (keys.size() == pp.item_num) {
+        baxos.solve(keys, values, encoded, prng, thread_num());
+        return encoded;
+    }
+
     auto padded_keys = pad_keys(pp, keys);
     auto padded_values = pad_values(values, padded_keys.size());
     // Solve/encode the given input/value pair. The Paxos data structure is written to output.
