@@ -8,6 +8,7 @@
 #include <taihang/common/bench_setting.hpp>
 #include <taihang/common/config.hpp>
 #include <taihang/crypto/prg.hpp>
+#include <taihang/crypto/x25519_simd.hpp>
 #include <openssl/obj_mac.h>
 
 #include <algorithm>
@@ -287,8 +288,13 @@ void print_header(const BenchConfig& config,
         << "\n"
         << "Receiver set (Y): 2^" << kLogReceiverLen << " = "
         << receiver_len << "\n"
-        << "Intersection    : 50% of X\n"
-        << "================================================================================\n";
+        << "Intersection    : 50% of X\n";
+    if (config.mqrpmt_curve_id == NID_X25519) {
+        std::cout << "X25519 Backend  : "
+                  << crypto::x25519_simd::backend_name(crypto::x25519_simd::Backend::Auto)
+                  << "\n";
+    }
+    std::cout << "================================================================================\n";
 }
 
 void print_result(const BenchConfig& config,

@@ -241,8 +241,8 @@ std::vector<uint8_t> server(net::NetIO& io, const PublicParameters& pp, const st
             // Determine intersection membership representation
             #pragma omp parallel for num_threads(config::thread_num)
             for (size_t i = 0; i < client_len; ++i) {
-                auto bytes = vec_fk1k2_x[i].to_bytes();
-                vec_indication_bit[i] = filter.contains(bytes.data(), bytes.size()) ? 1 : 0;
+                vec_indication_bit[i] =
+                    filter.contains(vec_fk1k2_x[i].px, EC25519Point::POINT_BYTE_LEN) ? 1 : 0;
             }
         }
         else{
