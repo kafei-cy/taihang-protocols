@@ -1,26 +1,25 @@
 /****************************************************************************
  * @file      bench_alsz_ote.cpp
  * @brief     Computation and communication benchmark for ALSZ OT extension.
- * @details   Measures complete chosen-message OT batches with fresh base OTs.
+ * @details   Projects decimal million-scale costs from 1/2/4-thread calibrations.
  * @author    Yu Chen
  *****************************************************************************/
 
 #include <taihang/common/config.hpp>
+#include <taihang/crypto/prg.hpp>
 #include <taihang/mpc/ot/alsz_ote.hpp>
 
 #include <openssl/obj_mac.h>
 
-#include <algorithm>
-#include <charconv>
+#include <array>
 #include <chrono>
 #include <cstdint>
+#include <ctime>
 #include <future>
 #include <iomanip>
 #include <iostream>
 #include <latch>
-#include <stdexcept>
 #include <string>
-#include <string_view>
 #include <vector>
 
 using namespace taihang;
@@ -32,22 +31,17 @@ using Clock = std::chrono::steady_clock;
 using Milliseconds = std::chrono::duration<double, std::milli>;
 
 constexpr size_t kBaseOtLen = 128;
+constexpr size_t kCalibrationOtCount = 1ULL << 20;
 constexpr int kCurveNid = NID_X9_62_prime256v1;
 constexpr char kAddress[] = "127.0.0.1";
-constexpr uint64_t kInputSeed = 0x243f6a8885a308d3ULL;
+constexpr uint16_t kPort = 12347;
+constexpr double kBytesPerMebibyte = 1024.0 * 1024.0;
+constexpr double kBytesPerKibibyte = 1024.0;
+constexpr std::array<int, 3> kThreadCounts{{1, 2, 4}};
 
-struct Options {
-    size_t count = 1ULL << 20;
-    int threads = 1;
-    size_t repeat = 5;
-    size_t warmup = 1;
-    uint16_t port = 12347;
-};
-
-struct BenchmarkInputs {
-    std::vector<Block> messages_0;
-    std::vector<Block> messages_1;
-    std::vector<uint8_t> choices;
+struct ProjectionCase {
+    const char* scale;
+    size_t ot_count;
 };
 
 struct CommunicationCost {
@@ -61,107 +55,26 @@ struct CommunicationCost {
     }
 };
 
-struct PartyTiming {
-    double elapsed_ms;
-    Clock::time_point end;
-};
-
 struct BenchmarkResult {
+    int threads_per_party;
+    size_t ot_count;
     double sender_ms;
     double receiver_ms;
     double wall_ms;
+    double cpu_ms;
+    CommunicationCost communication;
     bool verified;
 };
 
-void print_usage(const char* program) {
-    std::cout << "Usage: " << program
-              << " [--count N] [--threads T] [--repeat R] [--warmup W] [--port P]\n"
-              << "  --count    Actual OT count, a multiple of 128 in [128, 67108864]\n"
-              << "             (default: 1048576)\n"
-              << "  --threads  OpenMP threads per party in [1, 256] (default: 1)\n"
-              << "  --repeat   Measured batches in [1, 1000] (default: 5)\n"
-              << "  --warmup   Unmeasured batches in [0, 1000] (default: 1)\n"
-              << "  --port     Loopback TCP port in [1024, 65535] (default: 12347)\n";
-}
-
-uint64_t parse_number(std::string_view text, const std::string& option) {
-    uint64_t value = 0;
-    const auto result = std::from_chars(text.data(), text.data() + text.size(), value);
-    if (result.ec != std::errc{} || result.ptr != text.data() + text.size()) {
-        throw std::invalid_argument("Invalid number for " + option);
-    }
-    return value;
-}
-
-Options parse_options(int argc, char** argv) {
-    Options options;
-    for (int i = 1; i < argc; ++i) {
-        const std::string option = argv[i];
-        if (option != "--count" && option != "--threads" && option != "--repeat"
-            && option != "--warmup" && option != "--port") {
-            throw std::invalid_argument("Unknown option: " + option);
-        }
-        if (++i == argc) {
-            throw std::invalid_argument("Missing value for " + option);
-        }
-        const uint64_t value = parse_number(argv[i], option);
-        if (option == "--count") {
-            if (value < 128 || value > (1ULL << 26) || value % 128 != 0) {
-                throw std::invalid_argument("--count must be a multiple of 128 in [128, 67108864]");
-            }
-            options.count = static_cast<size_t>(value);
-        } else if (option == "--threads") {
-            if (value < 1 || value > 256) {
-                throw std::invalid_argument("--threads must be in [1, 256]");
-            }
-            options.threads = static_cast<int>(value);
-        } else if (option == "--repeat") {
-            if (value < 1 || value > 1000) {
-                throw std::invalid_argument("--repeat must be in [1, 1000]");
-            }
-            options.repeat = static_cast<size_t>(value);
-        } else if (option == "--warmup") {
-            if (value > 1000) {
-                throw std::invalid_argument("--warmup must be in [0, 1000]");
-            }
-            options.warmup = static_cast<size_t>(value);
-        } else {
-            if (value < 1024 || value > 65535) {
-                throw std::invalid_argument("--port must be in [1024, 65535]");
-            }
-            options.port = static_cast<uint16_t>(value);
-        }
-    }
-    return options;
-}
-
-// Reproducible public benchmark inputs; protocol randomness remains unchanged.
-uint64_t splitmix64(uint64_t& state) {
-    uint64_t value = (state += 0x9e3779b97f4a7c15ULL);
-    value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
-    value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
-    return value ^ (value >> 31);
-}
-
-BenchmarkInputs make_inputs(size_t count) {
-    BenchmarkInputs inputs{
-        std::vector<Block>(count),
-        std::vector<Block>(count),
-        std::vector<uint8_t>(count),
-    };
-    uint64_t state = kInputSeed;
-    for (size_t i = 0; i < count; ++i) {
-        // Keep this order identical to the EMP comparison benchmark.
-        const uint64_t m0_low = splitmix64(state);
-        const uint64_t m0_high = splitmix64(state);
-        const uint64_t m1_low = splitmix64(state);
-        const uint64_t m1_high = splitmix64(state);
-        inputs.messages_0[i] = make_block(m0_high, m0_low);
-        inputs.messages_1[i] = make_block(m1_high, m1_low);
-        inputs.choices[i] = static_cast<uint8_t>(splitmix64(state) & 1);
-    }
-    return inputs;
-}
+struct ProjectionResult {
+    int threads_per_party;
+    ProjectionCase projection_case;
+    double sender_ms;
+    double receiver_ms;
+    double wall_ms;
+    double cpu_ms;
+    CommunicationCost communication;
+};
 
 CommunicationCost communication_cost(size_t ot_count,
                                      size_t base_ot_count,
@@ -186,150 +99,271 @@ CommunicationCost communication_cost(size_t ot_count,
     };
 }
 
-BenchmarkResult run_batch(const PublicParameters& pp, const Options& options,
-                          const BenchmarkInputs& inputs) {
+BenchmarkResult run_calibration(const PublicParameters& pp,
+                                int threads_per_party) {
+    prg::Seed seed = prg::set_seed(nullptr, 0);
+    std::vector<Block> messages_0 =
+        prg::gen_random_blocks(seed, kCalibrationOtCount);
+    std::vector<Block> messages_1 =
+        prg::gen_random_blocks(seed, kCalibrationOtCount);
+    std::vector<uint8_t> choices =
+        prg::gen_random_bits(seed, kCalibrationOtCount);
+
     std::vector<Block> received;
     std::latch parties_ready(2);
     std::latch start_protocol(1);
 
     auto sender_future = std::async(std::launch::async, [&]() {
-        net::NetIO io("server", kAddress, options.port);
+        net::NetIO io("server", kAddress, kPort);
         parties_ready.count_down();
         start_protocol.wait();
 
         const auto begin = Clock::now();
-        sender<BlockPolicy>(io, pp, inputs.messages_0, inputs.messages_1,
-                            options.count);
-        io.flush();
-        const auto end = Clock::now();
-        return PartyTiming{Milliseconds(end - begin).count(), end};
+        sender<BlockPolicy>(io, pp, messages_0, messages_1,
+                            kCalibrationOtCount);
+        return Milliseconds(Clock::now() - begin).count();
     });
 
     auto receiver_future = std::async(std::launch::async, [&]() {
-        net::NetIO io("client", kAddress, options.port);
+        net::NetIO io("client", kAddress, kPort);
         parties_ready.count_down();
         start_protocol.wait();
 
         const auto begin = Clock::now();
-        received = receiver<BlockPolicy>(io, pp, inputs.choices, options.count);
-        io.flush();
-        const auto end = Clock::now();
-        return PartyTiming{Milliseconds(end - begin).count(), end};
+        received = receiver<BlockPolicy>(io, pp, choices,
+                                         kCalibrationOtCount);
+        return Milliseconds(Clock::now() - begin).count();
     });
 
     parties_ready.wait();
+    const std::clock_t cpu_begin = std::clock();
     const auto wall_begin = Clock::now();
     start_protocol.count_down();
 
-    const PartyTiming sender_timing = sender_future.get();
-    const PartyTiming receiver_timing = receiver_future.get();
-    // End at protocol completion, excluding futures and NetIO destruction.
-    const auto wall_end = std::max(sender_timing.end, receiver_timing.end);
-    const double wall_ms = Milliseconds(wall_end - wall_begin).count();
+    const double sender_ms = sender_future.get();
+    const double receiver_ms = receiver_future.get();
+    const double wall_ms = Milliseconds(Clock::now() - wall_begin).count();
+    const double cpu_ms = 1000.0 * static_cast<double>(std::clock() - cpu_begin)
+                          / static_cast<double>(CLOCKS_PER_SEC);
 
-    bool verified = received.size() == options.count;
-    for (size_t i = 0; verified && i < options.count; ++i) {
-        const Block& expected = inputs.choices[i] == 0
-            ? inputs.messages_0[i] : inputs.messages_1[i];
+    bool verified = received.size() == kCalibrationOtCount;
+    for (size_t i = 0; verified && i < kCalibrationOtCount; ++i) {
+        const Block& expected = choices[i] == 0 ? messages_0[i] : messages_1[i];
         verified = received[i] == expected;
-        if (!verified) {
-            std::cerr << "OT verification failed at index " << i << '\n';
-        }
     }
 
-    return {sender_timing.elapsed_ms, receiver_timing.elapsed_ms, wall_ms, verified};
-}
-
-void print_configuration(const PublicParameters& pp, const Options& options) {
     const size_t point_bytes = pp.base_ot_pp.group_ctx->get_point_byte_len();
-    const CommunicationCost cost = communication_cost(options.count, pp.base_len, point_bytes);
+    return {
+        threads_per_party,
+        kCalibrationOtCount,
+        sender_ms,
+        receiver_ms,
+        wall_ms,
+        cpu_ms,
+        communication_cost(kCalibrationOtCount, pp.base_len, point_bytes),
+        verified,
+    };
+}
+
+ProjectionResult project(const BenchmarkResult& calibration,
+                         const ProjectionCase& projection_case,
+                         const PublicParameters& pp) {
+    const double ratio = static_cast<double>(projection_case.ot_count)
+                         / static_cast<double>(calibration.ot_count);
+    const size_t point_bytes = pp.base_ot_pp.group_ctx->get_point_byte_len();
+
+    return {
+        calibration.threads_per_party,
+        projection_case,
+        calibration.sender_ms * ratio,
+        calibration.receiver_ms * ratio,
+        calibration.wall_ms * ratio,
+        calibration.cpu_ms * ratio,
+        communication_cost(projection_case.ot_count, pp.base_len, point_bytes),
+    };
+}
+
+double seconds(double milliseconds) {
+    return milliseconds / 1000.0;
+}
+
+double mebibytes(uint64_t bytes) {
+    return static_cast<double>(bytes) / kBytesPerMebibyte;
+}
+
+double million_ots_per_second(size_t ot_count, double wall_ms) {
+    return static_cast<double>(ot_count) / wall_ms / 1000.0;
+}
+
+double cpu_nanoseconds_per_ot(size_t ot_count, double cpu_ms) {
+    return cpu_ms * 1'000'000.0 / static_cast<double>(ot_count);
+}
+
+void print_configuration(const PublicParameters& pp) {
     std::cout
-        << "\n================================================================================\n"
+        << "\n===============================================================================================\n"
         << "Taihang ALSZ OT Extension Benchmark\n"
-        << "--------------------------------------------------------------------------------\n"
+        << "===============================================================================================\n"
         << "Mode                  : single-machine loopback\n"
-        << "Protocol              : semi-honest, complete chosen-message 1-out-of-2 OT\n"
-        << "Message size          : 128 bits\n"
+        << "Protocol              : semi-honest ALSZ, 128-bit Block messages\n"
         << "Base OTs              : " << pp.base_len << " Naor-Pinkas OTs on NIST P-256\n"
-        << "EC point encoding     : " << point_bytes << " bytes (compressed)\n"
-        << "OpenMP threads/party  : " << options.threads << '\n'
-        << "Actual OT count       : " << options.count << '\n'
-        << "Warmup / repetitions  : " << options.warmup << " / " << options.repeat << '\n'
-        << "Base OT policy        : fresh base OTs inside every timed batch, including warmup\n"
-        << "Timing scope          : full OT and final flush; inputs, connection setup,\n"
-        << "                        verification and socket destruction excluded\n"
-        << "Input seed            : 0x243f6a8885a308d3 (SplitMix64, public test inputs only)\n"
-        << "Estimated base bytes  : " << cost.base_ot_bytes << '\n'
-        << "Estimated OTE bytes   : " << cost.extension_bytes << '\n'
-        << "Estimated S -> R bytes: " << cost.sender_to_receiver_bytes << '\n'
-        << "Estimated R -> S bytes: " << cost.receiver_to_sender_bytes << '\n'
-        << "Estimated total bytes : " << cost.total_bytes() << '\n'
-        << "Communication scope   : formula-derived application payload, excluding TCP/IP\n"
-        << "================================================================================\n"
-        << "# sample,implementation,round,count,threads,sender_ms,receiver_ms,wall_ms,verified\n";
+        << "EC point encoding     : "
+        << pp.base_ot_pp.group_ctx->get_point_byte_len() << " bytes (compressed)\n"
+        << "OpenMP threads/party  : 1, 2, and 4 (measured independently)\n"
+        << "Calibration batch     : " << kCalibrationOtCount << " OTs (2^20)\n"
+        << "Timing scope          : protocol only; input generation, connection setup, and verification excluded\n"
+        << "Communication scope   : application payload bytes; TCP/IP framing excluded\n"
+        << "===============================================================================================\n";
 }
 
-void print_sample(const char* kind, size_t round, const Options& options,
-                  const BenchmarkResult& result) {
-    std::cout << kind << ",taihang," << round << ',' << options.count << ','
-              << options.threads << ',' << std::fixed << std::setprecision(6)
-              << result.sender_ms << ',' << result.receiver_ms << ','
-              << result.wall_ms << ',' << (result.verified ? 1 : 0) << '\n';
+void print_calibration(const std::vector<BenchmarkResult>& calibrations) {
+    std::cout
+        << "\nMeasured calibration by threads per party\n"
+        << "------------------------------------------------------------------------------------------------\n"
+        << std::left << std::setw(13) << "Threads/party"
+        << std::right << std::setw(14) << "OT count"
+        << std::setw(15) << "Sender (s)"
+        << std::setw(15) << "Receiver (s)"
+        << std::setw(13) << "Wall (s)"
+        << std::setw(13) << "CPU (s)"
+        << std::setw(13) << "M OT/s"
+        << std::setw(12) << "CPU ns/OT"
+        << std::setw(12) << "Status" << "\n"
+        << "------------------------------------------------------------------------------------------------\n";
+
+    for (const auto& calibration : calibrations) {
+        std::cout
+            << std::left << std::setw(13) << calibration.threads_per_party
+            << std::right << std::setw(14) << calibration.ot_count
+            << std::fixed << std::setprecision(3)
+            << std::setw(15) << seconds(calibration.sender_ms)
+            << std::setw(15) << seconds(calibration.receiver_ms)
+            << std::setw(13) << seconds(calibration.wall_ms)
+            << std::setw(13) << seconds(calibration.cpu_ms)
+            << std::setw(13)
+            << million_ots_per_second(calibration.ot_count, calibration.wall_ms)
+            << std::setw(12) << std::setprecision(1)
+            << cpu_nanoseconds_per_ot(calibration.ot_count, calibration.cpu_ms)
+            << std::setw(12) << (calibration.verified ? "PASS" : "FAIL")
+            << "\n";
+    }
+    std::cout << "------------------------------------------------------------------------------------------------\n";
 }
 
-void print_summary(const char* metric, std::vector<double> values,
-                   const Options& options) {
-    std::sort(values.begin(), values.end());
-    const size_t mid = values.size() / 2;
-    const double median = values.size() % 2 == 0
-        ? (values[mid - 1] + values[mid]) / 2 : values[mid];
-    std::cout << "summary,taihang," << metric << ',' << options.count << ','
-              << options.threads << ',' << options.repeat << ','
-              << std::fixed << std::setprecision(6) << median << ','
-              << values.front() << ',' << values.back() << '\n';
+void print_computation_report(const std::vector<ProjectionResult>& projections) {
+    std::cout
+        << "\nInferred computation and end-to-end performance\n"
+        << "------------------------------------------------------------------------------------------------------------------\n"
+        << std::left << std::setw(10) << "Scale"
+        << std::setw(13) << "Threads/party"
+        << std::right << std::setw(14) << "Target OTs"
+        << std::setw(15) << "Sender est.(s)"
+        << std::setw(17) << "Receiver est.(s)"
+        << std::setw(13) << "Wall est.(s)"
+        << std::setw(12) << "CPU est.(s)"
+        << std::setw(13) << "M OT/s"
+        << std::setw(14) << "CPU ns/OT" << "\n"
+        << "------------------------------------------------------------------------------------------------------------------\n";
+
+    for (const auto& projection : projections) {
+        std::cout
+            << std::left << std::setw(10) << projection.projection_case.scale
+            << std::setw(13) << projection.threads_per_party
+            << std::right << std::setw(14) << projection.projection_case.ot_count
+            << std::fixed << std::setprecision(3)
+            << std::setw(15) << seconds(projection.sender_ms)
+            << std::setw(17) << seconds(projection.receiver_ms)
+            << std::setw(13) << seconds(projection.wall_ms)
+            << std::setw(12) << seconds(projection.cpu_ms)
+            << std::setw(13)
+            << million_ots_per_second(projection.projection_case.ot_count,
+                                      projection.wall_ms)
+            << std::setw(14) << std::setprecision(1)
+            << cpu_nanoseconds_per_ot(projection.projection_case.ot_count,
+                                      projection.cpu_ms)
+            << "\n";
+    }
+    std::cout << "------------------------------------------------------------------------------------------------------------------\n"
+              << "Estimates scale the measured 2^20 amortized timings linearly with OT count.\n"
+              << "CPU time is aggregate across both parties and all OpenMP workers.\n"
+              << "The projection does not model cache, memory-bandwidth, or network saturation effects.\n";
+}
+
+void print_communication_report(const std::vector<ProjectionResult>& projections) {
+    std::cout
+        << "\nCommunication payload\n"
+        << "---------------------------------------------------------------------------------------------------------------------------------------------\n"
+        << std::left << std::setw(10) << "Scale"
+        << std::setw(13) << "Threads/party"
+        << std::right << std::setw(14) << "Target OTs"
+        << std::setw(14) << "Base OT KiB"
+        << std::setw(16) << "Extension MiB"
+        << std::setw(14) << "S -> R MiB"
+        << std::setw(14) << "R -> S MiB"
+        << std::setw(16) << "Total bytes"
+        << std::setw(13) << "Total MiB"
+        << std::setw(12) << "Bytes/OT" << "\n"
+        << "---------------------------------------------------------------------------------------------------------------------------------------------\n";
+
+    for (const auto& projection : projections) {
+        const auto& cost = projection.communication;
+        std::cout
+            << std::left << std::setw(10) << projection.projection_case.scale
+            << std::setw(13) << projection.threads_per_party
+            << std::right << std::setw(14) << projection.projection_case.ot_count
+            << std::fixed << std::setprecision(2)
+            << std::setw(14) << static_cast<double>(cost.base_ot_bytes) / kBytesPerKibibyte
+            << std::setw(16) << mebibytes(cost.extension_bytes)
+            << std::setw(14) << mebibytes(cost.sender_to_receiver_bytes)
+            << std::setw(14) << mebibytes(cost.receiver_to_sender_bytes)
+            << std::setw(16) << cost.total_bytes()
+            << std::setw(13) << mebibytes(cost.total_bytes())
+            << std::setw(12) << static_cast<double>(cost.total_bytes())
+                                  / projection.projection_case.ot_count
+            << "\n";
+    }
+    std::cout << "---------------------------------------------------------------------------------------------------------------------------------------------\n"
+              << "S -> R and R -> S refer to the ALSZ sender and receiver roles.\n"
+              << "Payload is derived from the protocol and retains one fixed base-OT cost per target batch.\n"
+              << "For 128-bit messages, the extension payload approaches 48 bytes per OT.\n";
 }
 
 } // namespace
 
-int main(int argc, char** argv) {
-    try {
-        if (argc == 2 && (std::string_view(argv[1]) == "--help"
-                          || std::string_view(argv[1]) == "-h")) {
-            print_usage(argv[0]);
-            return 0;
-        }
-        const Options options = parse_options(argc, argv);
-        config::use_point_compression = true;
-        config::thread_num = options.threads;
-        const PublicParameters pp = setup(kCurveNid, kBaseOtLen);
-        const BenchmarkInputs inputs = make_inputs(options.count);
-        print_configuration(pp, options);
+int main() {
+    constexpr std::array<ProjectionCase, 2> projection_cases{{
+        {"10^6", 1'000'000},
+        {"10^7", 10'000'000},
+    }};
 
-        // Warmup initializes machine/library state without reusing base-OT seeds.
-        for (size_t round = 0; round < options.warmup; ++round) {
-            const BenchmarkResult result = run_batch(pp, options, inputs);
-            print_sample("warmup", round + 1, options, result);
-            if (!result.verified) return 1;
-        }
+    config::use_point_compression = true;
+    const PublicParameters pp = setup(kCurveNid, kBaseOtLen);
+    print_configuration(pp);
 
-        std::vector<double> sender_times, receiver_times, wall_times;
-        for (size_t round = 0; round < options.repeat; ++round) {
-            const BenchmarkResult result = run_batch(pp, options, inputs);
-            print_sample("sample", round + 1, options, result);
-            if (!result.verified) return 1;
-            sender_times.push_back(result.sender_ms);
-            receiver_times.push_back(result.receiver_ms);
-            wall_times.push_back(result.wall_ms);
-        }
+    std::vector<BenchmarkResult> calibrations;
+    calibrations.reserve(kThreadCounts.size());
 
-        std::cout << "# summary,implementation,metric,count,threads,repeat,median_ms,min_ms,max_ms\n";
-        print_summary("sender", sender_times, options);
-        print_summary("receiver", receiver_times, options);
-        print_summary("wall", wall_times, options);
-        return 0;
-    } catch (const std::exception& error) {
-        std::cerr << "Benchmark error: " << error.what() << '\n';
-        print_usage(argv[0]);
-        return 1;
+    std::vector<ProjectionResult> projections;
+    projections.reserve(kThreadCounts.size() * projection_cases.size());
+    for (const int threads_per_party : kThreadCounts) {
+        config::thread_num = threads_per_party;
+        std::cout << "\nRunning calibration with " << threads_per_party
+                  << " OpenMP thread(s) per party ...\n";
+        calibrations.push_back(run_calibration(pp, threads_per_party));
+        const auto& calibration = calibrations.back();
+        for (const auto& projection_case : projection_cases) {
+            projections.push_back(project(calibration, projection_case, pp));
+        }
     }
+
+    print_calibration(calibrations);
+    print_computation_report(projections);
+    print_communication_report(projections);
+
+    for (const auto& calibration : calibrations) {
+        if (!calibration.verified) {
+            return 1;
+        }
+    }
+    return 0;
 }
