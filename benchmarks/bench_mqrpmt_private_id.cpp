@@ -7,6 +7,7 @@
 #include <taihang/mpc/pso/mqrpmt_private_id.hpp>
 #include <taihang/common/bench_setting.hpp>
 #include <taihang/common/config.hpp>
+#include <taihang/crypto/x25519_simd.hpp>
 
 #include <openssl/obj_mac.h>
 
@@ -166,8 +167,13 @@ void print_header(const BenchConfig& config, size_t item_len) {
         << "--------------------------------------------------------------------------------\n"
         << "Sender set   (X): 2^" << kLogItemLen << " = " << item_len << "\n"
         << "Receiver set (Y): 2^" << kLogItemLen << " = " << item_len << "\n"
-        << "Intersection    : 50%\n"
-        << "================================================================================\n";
+        << "Intersection    : 50%\n";
+    if (config.mqrpmt_curve_id == NID_X25519) {
+        std::cout << "X25519 Backend  : "
+                  << crypto::x25519_simd::backend_name(crypto::x25519_simd::Backend::Auto)
+                  << "\n";
+    }
+    std::cout << "================================================================================\n";
 }
 
 void print_result(const Dataset& dataset, const BenchResult& result) {
