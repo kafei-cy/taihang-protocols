@@ -9,7 +9,6 @@
 #include <taihang/crypto/prg.hpp>
 #include <taihang/crypto/stream_cipher.hpp>
 #include <algorithm>
-#include <cstring>
 #include <exception>
 #include <format>
 #include <omp.h>
@@ -17,83 +16,6 @@
 #include <utility>
 
 namespace taihang::mpc::alsz_ote {
-
-#if defined(TAIHANG_ARCH_X64)
-template <size_t Width>
-static void interleave_matrix_rows(__m128i* rows) {
-    __m128i next[16];
-    for(size_t group = 0; group < 16; group += 2 * Width) {
-        for(size_t i = 0; i < Width; i++) {
-            const __m128i a = rows[group + i];
-            const __m128i b = rows[group + Width + i];
-            const size_t index = group + 2 * i;
-            if constexpr (Width == 1) {
-                next[index] = _mm_unpacklo_epi8(a, b);
-                next[index + 1] = _mm_unpackhi_epi8(a, b);
-            } else if constexpr (Width == 2) {
-                next[index] = _mm_unpacklo_epi16(a, b);
-                next[index + 1] = _mm_unpackhi_epi16(a, b);
-            } else if constexpr (Width == 4) {
-                next[index] = _mm_unpacklo_epi32(a, b);
-                next[index + 1] = _mm_unpackhi_epi32(a, b);
-            } else {
-                next[index] = _mm_unpacklo_epi64(a, b);
-                next[index + 1] = _mm_unpackhi_epi64(a, b);
-            }
-        }
-    }
-    for(size_t i = 0; i < 16; i++) rows[i] = next[i];
-}
-#endif
-
-static void transpose_matrix_tile(const Block* input, size_t tile_rows, Block* output) {
-#if defined(TAIHANG_ARCH_X64)
-    const size_t column_blocks = tile_rows / 128;
-    auto* bytes = reinterpret_cast<uint8_t*>(output);
-    for(size_t row = 0; row < 128; row += 16) {
-        for(size_t block = 0; block < column_blocks; block++) {
-            __m128i rows[16];
-            for(size_t i = 0; i < 16; i++) {
-                rows[i] = input[(row + i) * column_blocks + block].mm;
-            }
-            interleave_matrix_rows<1>(rows);
-            interleave_matrix_rows<2>(rows);
-            interleave_matrix_rows<4>(rows);
-            interleave_matrix_rows<8>(rows);
-            for(size_t column = 0; column < 16; column++) {
-                __m128i bits = rows[column];
-                for(int bit = 7; bit >= 0; bit--) {
-                    const uint16_t mask = static_cast<uint16_t>(_mm_movemask_epi8(bits));
-                    const size_t output_row = block * 128 + column * 8 + bit;
-                    std::memcpy(bytes + output_row * sizeof(Block) + row / 8,
-                                &mask, sizeof(mask));
-                    bits = _mm_slli_epi64(bits, 1);
-                }
-            }
-        }
-    }
-#else
-    bit_matrix_transpose(reinterpret_cast<const uint8_t*>(input), 128, tile_rows,
-                         reinterpret_cast<uint8_t*>(output));
-#endif
-}
-
-static void pack_selection_bits(const uint8_t* byte_data, size_t byte_len,
-                         Block* block_data, size_t block_len) {
-#if defined(TAIHANG_ARCH_X64)
-    TAIHANG_ASSERT(byte_len == block_len * 128, "pack bits to blocks: size mismatch.");
-    auto* out = reinterpret_cast<uint8_t*>(block_data);
-    for(size_t i = 0; i < byte_len; i += 16) {
-        const __m128i values = _mm_loadu_si128(reinterpret_cast<const __m128i*>(byte_data + i));
-        const unsigned mask = static_cast<unsigned>(~_mm_movemask_epi8(
-            _mm_cmpeq_epi8(values, _mm_setzero_si128()))) & 0xffff;
-        out[i / 8] = static_cast<uint8_t>(mask);
-        out[i / 8 + 1] = static_cast<uint8_t>(mask >> 8);
-    }
-#else
-    pack_bits_to_blocks(byte_data, byte_len, block_data, block_len);
-#endif
-}
 
 // --- PublicParameters ---
 
@@ -155,7 +77,7 @@ static std::pair<std::vector<Block>, std::vector<Block>> random_sender_impl(
 
     // crush selection bit vector in sparse form to dense form
     std::vector<Block> vec_sender_selection_block(column_num / 128);
-    pack_selection_bits(vec_sender_selection_bit.data(), column_num, vec_sender_selection_block.data(), column_num / 128);
+    pack_bits_to_blocks(vec_sender_selection_bit.data(), column_num, vec_sender_selection_block.data(), column_num / 128);
     const auto& fixed_key = aes::get_fixed_key();
 
     if(column_num == 128) {
@@ -205,7 +127,8 @@ static std::pair<std::vector<Block>, std::vector<Block>> random_sender_impl(
 
                     Block* k0 = vec_k0.data() + offset;
                     Block* k1 = vec_k1.data() + offset;
-                    transpose_matrix_tile(matrix_q, tile_rows, k0);
+                    bit_matrix_transpose(reinterpret_cast<const uint8_t*>(matrix_q), 128, tile_rows,
+                                         reinterpret_cast<uint8_t*>(k0));
                     for(size_t j = 0; j < tile_rows; j += hash_batch_size) {
                         const size_t batch_size = std::min(hash_batch_size, tile_rows - j);
                         for(size_t i = 0; i < batch_size; i++) {
@@ -349,8 +272,8 @@ std::vector<Block> random_receiver(net::NetIO& io, const PublicParameters& pp, c
                     const size_t offset = window + tile;
                     const size_t tile_rows = std::min(matrix_batch_size, window_rows - tile);
                     const size_t tile_blocks = tile_rows / 128;
-                    pack_selection_bits(vec_receiver_selection_bit.data() + offset, tile_rows,
-                                        selection, tile_blocks);
+                    pack_bits_to_blocks(vec_receiver_selection_bit.data() + offset, tile_rows,
+                                       selection, tile_blocks);
                     for(size_t j = 0; j < column_num; j++) {
                         prg::Seed t_seed = t_seeds[j];
                         prg::Seed u_seed = u_seeds[j];
@@ -364,7 +287,8 @@ std::vector<Block> random_receiver(net::NetIO& io, const PublicParameters& pp, c
                         }
                     }
                     Block* output = vec_k.data() + offset;
-                    transpose_matrix_tile(matrix_t, tile_rows, output);
+                    bit_matrix_transpose(reinterpret_cast<const uint8_t*>(matrix_t), 128, tile_rows,
+                                         reinterpret_cast<uint8_t*>(output));
                     aes::encrypt_ecb(fixed_key, output, output, tile_rows);
                 }
                 #pragma omp master
@@ -388,7 +312,7 @@ std::vector<Block> random_receiver(net::NetIO& io, const PublicParameters& pp, c
 
     // crush sparse bytes to dense bytes
     std::vector<Block> vec_receiver_selection_block(row_num / 128);
-    pack_selection_bits(vec_receiver_selection_bit.data(), row_num, vec_receiver_selection_block.data(), row_num / 128);
+    pack_bits_to_blocks(vec_receiver_selection_bit.data(), row_num, vec_receiver_selection_block.data(), row_num / 128);
 
     // derive matrix T, U, and P: size = ROW_NUM/128*COLUMN_NUM
     const size_t column_blocks = row_num / 128;
